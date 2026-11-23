@@ -13,7 +13,7 @@ API_BASE = os.environ.get("API_BASE", "https://governor.pythonanywhere.com")
 EAT = timezone(timedelta(hours=3))
 
 
-def fetch_locked_branch_names():
+def fetch_locked_branches():
     try:
         r = requests.get(f"{API_BASE}/api/get-all-branches", timeout=25)
         r.raise_for_status()
@@ -29,11 +29,11 @@ def fetch_locked_branch_names():
             months = data.get("months") if isinstance(data.get("months"), dict) else {}
             m_obj = months.get(month) if month in months and isinstance(months.get(month), dict) else None
             if data.get("setupLocked") or (m_obj and m_obj.get("setupLocked")):
-                locked.append(name)
-        print(f"Locked branches from API ({len(locked)}): {locked}")
+                locked.append((name, data))
+        print(f"Locked branches ({len(locked)}): {[n for n, _ in locked]}")
         return locked
     except Exception as exc:
-        print(f"Warning fetching locked branches from API: {exc}")
+        print(f"Warning fetching locked branches: {exc}")
         return []
 
 
@@ -43,19 +43,17 @@ def wait_for_app_ready(page):
         page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
-    page.wait_for_timeout(2500)
+    page.wait_for_timeout(2000)
 
 
 def hide_regional_totals(page):
-    # Only hide specific table rows or small row-like elements—never broad container divs
     page.evaluate(
         """() => {
             const keywords = ["regional total", "regional totals", "region total", "region totals"];
-            const candidates = document.querySelectorAll("tr, [role='row'], .summary-row, .totals-row, li");
-            for (const el of candidates) {
+            const rows = document.querySelectorAll("tr, [role='row'], .summary-row, .totals-row");
+            for (const el of rows) {
                 const txt = (el.innerText || "").trim().toLowerCase();
-                if (!txt || txt.length > 300) continue;
-                if (keywords.some(k => txt.includes(k))) {
+                if (txt && txt.length < 400 && keywords.some(k => txt.includes(k))) {
                     el.style.setProperty("display", "none", "important");
                 }
             }
@@ -65,87 +63,82 @@ def hide_regional_totals(page):
 
 
 def open_general_summary(page):
-    candidates = [
-        page.get_by_role("button", name=re.compile(r"general\s*branches?\s*summary|branches?\s*summary|summary", re.I)),
-        page.get_by_role("link", name=re.compile(r"general\s*branches?\s*summary|branches?\s*summary|summary", re.I)),
-        page.get_by_role("tab", name=re.compile(r"general\s*branches?\s*summary|branches?\s*summary|summary", re.I)),
-        page.locator("button, a, [role='button'], .btn, .tab").filter(has_text=re.compile(r"general\s*branches?\s*summary|branches?\s*summary|summary", re.I)),
-    ]
-    for loc in candidates:
-        try:
-            count = loc.count()
-            for i in range(count):
+    # First check if a summary button/tab is already visible
+    summary_patterns = re.compile(r"general\s*branches?\s*summary|branches?\s*summary|summary", re.I)
+    for role in ("button", "link", "tab"):
+        loc = page.get_by_role(role, name=summary_patterns)
+        for i in range(loc.count()):
+            item = loc.nth(i)
+            if item.is_visible():
+                item.click()
+                page.wait_for_timeout(1500)
+                hide_regional_totals(page)
+                return
+
+    # Otherwise open Admin Portal and look for summary inside it
+    admin_btn = page.locator("button, a").filter(has_text=re.compile(r"admin\s*portal", re.I)).first
+    if admin_btn.count() and admin_btn.is_visible():
+        admin_btn.click()
+        page.wait_for_timeout(1500)
+        for role in ("button", "link", "tab"):
+            loc = page.get_by_role(role, name=summary_patterns)
+            for i in range(loc.count()):
                 item = loc.nth(i)
                 if item.is_visible():
-                    label = (item.inner_text() or "").strip()
-                    print(f"Clicking summary control: '{label}'")
                     item.click()
                     page.wait_for_timeout(1500)
-                    hide_regional_totals(page)
-                    return True
-        except Exception as exc:
-            print(f"Summary click candidate failed: {exc}")
+                    break
 
     hide_regional_totals(page)
-    return False
 
 
-def select_branch_in_ui(page, branch_name):
+def select_branch_and_load(page, branch_name, branch_data=None):
     # 1. Native <select> dropdowns
     selects = page.locator("select")
     for i in range(selects.count()):
         sel = selects.nth(i)
-        try:
-            if not sel.is_visible():
-                continue
-            options = sel.locator("option")
-            for j in range(options.count()):
-                opt_text = (options.nth(j).inner_text() or "").strip()
-                opt_val = (options.nth(j).get_attribute("value") or "").strip()
-                if branch_name.lower() == opt_text.lower() or branch_name.lower() in opt_text.lower() or branch_name.lower() == opt_val.lower():
-                    sel.select_option(value=opt_val if opt_val else opt_text)
-                    page.wait_for_timeout(1500)
-                    return True
-        except Exception:
+        if not sel.is_visible():
             continue
+        options = sel.locator("option")
+        for j in range(options.count()):
+            opt_text = (options.nth(j).inner_text() or "").strip()
+            opt_val = (options.nth(j).get_attribute("value") or "").strip()
+            if branch_name.lower() == opt_text.lower() or branch_name.lower() == opt_val.lower():
+                sel.select_option(value=opt_val if opt_val else opt_text)
+                page.wait_for_timeout(2000)
+                return True
 
-    # 2. Visible text/search inputs
-    inputs = page.locator("input[type='text'], input[type='search'], input:not([type])")
+    # 2. Branch name text input: dispatch input, change, blur, and Enter so React/JS listeners load saved data
+    inputs = page.locator("input[type='text'], input:not([type])")
     for i in range(inputs.count()):
         inp = inputs.nth(i)
-        try:
-            if not inp.is_visible():
-                continue
-            ph = (inp.get_attribute("placeholder") or "").lower()
-            lbl = (inp.get_attribute("aria-label") or "").lower()
-            if "branch" in ph or "branch" in lbl or "search" in ph or i == 0:
-                inp.fill(branch_name)
-                inp.press("Enter")
-                page.wait_for_timeout(1500)
-                return True
-        except Exception:
+        if not inp.is_visible():
             continue
+        ph = (inp.get_attribute("placeholder") or "").lower()
+        lbl = (inp.get_attribute("aria-label") or "").lower()
+        if "branch" in ph or "branch" in lbl or i == 0:
+            inp.click()
+            inp.fill("")
+            inp.type(branch_name, delay=40)
+            inp.evaluate(
+                """el => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.blur();
+                }"""
+            )
+            page.wait_for_timeout(2000)
 
-    # 3. Clickable branch item/button
-    try:
-        item = page.locator("button, a, [role='button'], li, .branch-item").filter(has_text=re.compile(rf"^{re.escape(branch_name)}$", re.I)).first
-        if item.is_visible(timeout=1500):
-            item.click()
-            page.wait_for_timeout(1500)
+            # If a load/open/view button exists next to branch selection, click it
+            for btn_re in [r"load\s*branch", r"open\s*branch", r"view\s*sheet", r"load\s*sheet"]:
+                b = page.locator("button").filter(has_text=re.compile(btn_re, re.I)).first
+                if b.count() and b.is_visible():
+                    b.click()
+                    page.wait_for_timeout(2000)
+                    break
             return True
-    except Exception:
-        pass
 
     return False
-
-
-def capture_best_png(page):
-    # Ensure page is scrolled to top and visible before capturing
-    page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(400)
-    body_len = page.evaluate("() => (document.body ? document.body.innerText.trim().length : 0)")
-    print(f"Page body text length before screenshot: {body_len}")
-    return page.screenshot(full_page=True)
 
 
 def send_photo(png_bytes, caption):
@@ -166,7 +159,7 @@ def send_photo(png_bytes, caption):
 
 def run_dispatch():
     stamp = datetime.now(EAT).strftime("%Y-%m-%d %H:%M EAT")
-    locked_branches = fetch_locked_branch_names()
+    locked_branches = fetch_locked_branches()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -176,20 +169,22 @@ def run_dispatch():
         # 1. General Branches Summary screenshot (excluding regional totals)
         wait_for_app_ready(page)
         open_general_summary(page)
-        summary_png = capture_best_png(page)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(400)
+        summary_png = page.screenshot(full_page=True)
         send_photo(summary_png, f"General Branches Summary ({stamp}) — Regional Totals Excluded")
         time.sleep(0.5)
 
         # 2. Independent screenshot for each locked branch
         total = len(locked_branches)
-        for idx, b_name in enumerate(locked_branches, start=1):
+        for idx, (b_name, b_data) in enumerate(locked_branches, start=1):
             wait_for_app_ready(page)
-            if select_branch_in_ui(page, b_name):
-                branch_png = capture_best_png(page)
+            if select_branch_and_load(page, b_name, b_data):
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(400)
+                branch_png = page.screenshot(full_page=True)
                 send_photo(branch_png, f"[{idx}/{total}] Branch Report: {b_name} ({stamp})")
                 time.sleep(0.4)
-            else:
-                print(f"Could not select branch in UI: {b_name}")
 
         browser.close()
 
