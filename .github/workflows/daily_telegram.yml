@@ -18,11 +18,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install pillow requests
+        run: |
+          pip install requests playwright
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: Run daily Telegram screenshot dispatch
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BRANCH_API_URL: "https://governor.pythonanywhere.com"
+          APP_URL: "https://targetsheet0.netlify.app/"
+          API_BASE: "https://governor.pythonanywhere.com"
         run: python scripts/send_telegram_reports.py
